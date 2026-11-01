@@ -16,7 +16,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, '..'))
 CFG = json.load(open(os.path.join(ROOT, 'edit.json')))
 FRAMES = sys.argv[1]
-W, H = CFG['size']
+FORMAT = sys.argv[sys.argv.index('--format') + 1] if '--format' in sys.argv else 'landscape'
+VERT = FORMAT == 'vertical'
+W, H = (1080, 1920) if VERT else tuple(CFG['size'])
 FPS = CFG['fps']
 BEAT = 60.0 / CFG['bpm']
 TOTAL = CFG['total_beats'] * BEAT
@@ -42,10 +44,18 @@ def font(w, s):
     return _fc[k]
 
 # ---------- layout ----------
-M = 44
-DASH = (M, 54, 551, 972)                 # x, y, w, h
-MAPR = (M + 551 + 24, 54, 700, 972)
-INFO = (MAPR[0] + 700 + 24, 54, W - M - (MAPR[0] + 700 + 24), 972)
+if VERT:   # 9:16 — wide map on top, dashcam + steps/instruction below
+    M = 36
+    MAPR = (M, 60, W - 2 * M, 740)
+    DASH = (M, 824, 576, 1036)
+    INFO = (M + 576 + 20, 824, W - M - (M + 576 + 20), 1036)
+    MAP_SCALE_CAP = 2.0
+else:      # 16:9 — dashcam | map | steps
+    M = 44
+    DASH = (M, 54, 551, 972)                 # x, y, w, h
+    MAPR = (M + 551 + 24, 54, 700, 972)
+    INFO = (MAPR[0] + 700 + 24, 54, W - M - (MAPR[0] + 700 + 24), 972)
+    MAP_SCALE_CAP = 9.0
 RAD = 22
 
 def ease(x):  # easeOutCubic, clamped
@@ -99,7 +109,6 @@ def dash_image(t):
 # ---------- map segments, pin paths ----------
 PL = {k: cv2.imread(os.path.join(ROOT, 'assets/plates', f'{k}.png')) for k in CFG['maps']}
 order = sorted(CFG['maps'], key=lambda k: CFG['maps'][k]['from_frame'])
-track = json.load(open(os.path.join(ROOT, 'work', 'pin_track.json'))) if os.path.exists(os.path.join(ROOT, 'work', 'pin_track.json')) else json.load(open(os.path.join(ROOT, 'assets', 'pin_track.json')))
 
 def seg_of(src_t):
     f = src_t * FPS; k = order[0]
@@ -107,43 +116,27 @@ def seg_of(src_t):
         if f >= CFG['maps'][kk]['from_frame']: k = kk
     return k
 
-# per segment: polyline of pin positions vs source frame
-SEGPATH = {}
-for k in order:
-    s = CFG['maps'][k]['from_frame']
-    nxt = [CFG['maps'][kk]['from_frame'] for kk in order if CFG['maps'][kk]['from_frame'] > s]
-    e = min(nxt) if nxt else NSRC
-    fr, pts = [], []
-    for i in range(s, e):
-        p = track.get(str(i))
-        if p and p[0] == k:
-            fr.append(i); pts.append((p[1], p[2]))
-    SEGPATH[k] = (np.array(fr, float), np.array(pts, float))
+ROUTES = json.load(open(os.path.join(ROOT, 'assets', 'routes.json')))
+RP = {}
+for k, r in ROUTES.items():
+    path = np.array(r['path'], float)
+    lens = np.concatenate([[0], np.cumsum(np.hypot(*np.diff(path, axis=0).T))])
+    RP[k] = (path, lens, np.array(r['frames'], float), np.array(r['L'], float))
 
-# C route: geometry from track, timing re-synced to the dashcam (turn + arrival)
+# C: timing re-synced to the dashcam (turn + arrival) instead of the keyframed pin
 cr = CFG['c_route']
-fr, pts = SEGPATH['C']
-sel = (fr >= cr['track_frames'][0]) & (fr <= cr['track_frames'][1])
-cp = pts[sel][::6]
-keep = [cp[0]]
-for p in cp[1:]:
-    if np.hypot(*(p - keep[-1])) > 3: keep.append(p)
-CPATH = np.array(keep)
-# smooth the polyline a bit
-if len(CPATH) > 5:
-    k5 = np.ones(5) / 5
-    sm = np.stack([np.convolve(np.pad(CPATH[:, j], 2, mode='edge'), k5, 'valid') for j in range(2)], 1)
-    CPATH = sm
-CLEN = np.concatenate([[0], np.cumsum(np.hypot(*np.diff(CPATH, axis=0).T))])
-CORNER = int(np.argmax(CPATH[:, 1]))
+_cp, _cl, _cf, _cL = RP['C']
+C_L0 = float(np.interp(cr['start_src'] * FPS, _cf, _cL))
+C_LC = ROUTES['C']['L_corner']
+C_LE = float(_cl[-1])
+CPATH = _cp
+CORNER = int(np.argmin(np.abs(_cl - C_LC)))
 
 def c_pos_len(src_t):
     a, c, z = cr['start_src'], cr['corner_src'], cr['arrive_src']
     if src_t <= c:
-        L = CLEN[CORNER] * min(max((src_t - a) / (c - a), 0), 1)
-    else:
-        L = CLEN[CORNER] + (CLEN[-1] - CLEN[CORNER]) * min(max((src_t - c) / (z - c), 0), 1)
-    return L
+        return C_L0 + (C_LC - C_L0) * min(max((src_t - a) / (c - a), 0), 1)
+    return C_LC + (C_LE - C_LC) * min(max((src_t - c) / (z - c), 0), 1)
 
 def path_point(path, lens, L):
     i = min(np.searchsorted(lens, L, 'right') - 1, len(path) - 2)
@@ -153,23 +146,15 @@ def path_point(path, lens, L):
 
 def pin_at(k, src_t):
     """Returns (pin xy, full path, travelled length, lens) in plate coords."""
-    if k == 'C':
-        L = c_pos_len(src_t)
-        return path_point(CPATH, CLEN, L), CPATH, L, CLEN
-    fr, pts = SEGPATH[k]
-    f = src_t * FPS
-    x = np.interp(f, fr, pts[:, 0]); y = np.interp(f, fr, pts[:, 1])
-    path = pts[::10]
-    lens = np.concatenate([[0], np.cumsum(np.hypot(*np.diff(path, axis=0).T))])
-    # travelled length = projection by frame fraction
-    frac = (f - fr[0]) / max(fr[-1] - fr[0], 1)
-    return np.array([x, y]), path, lens[-1] * min(max(frac, 0), 1), lens
+    path, lens, fr, Ls = RP[k]
+    L = c_pos_len(src_t) if k == 'C' else float(np.interp(src_t * FPS, fr, Ls))
+    return path_point(path, lens, L), path, L, lens
 
 def map_view(k, t):
     """Scale + camera center (plate coords) for segment k at output t."""
     pl = PL[k]; ph, pw = pl.shape[:2]
     mw, mh = MAPR[2], MAPR[3]
-    s = max(mw / pw, mh / ph)
+    s = min(max(mw / pw, mh / ph), MAP_SCALE_CAP)
     # camera follows the pin, smoothed over +-0.6s of output time
     ts = np.linspace(t - 0.6, t + 0.6, 7)
     cs = []
@@ -184,7 +169,7 @@ def map_view(k, t):
     # arrival: zoom out to the whole final map
     zo = ease_io((t - b2t(72)) / (b2t(74.5) - b2t(72))) if k == 'C' else 0
     s_fit = min(mw / pw, mh / ph)
-    s = s + (s_fit - s) * zo
+    s = s + (min(s_fit, s) - s) * zo
     c = c + (np.array([pw / 2, ph / 2]) - c) * zo
     # clamp so the window stays inside the plate (when it is bigger than the window)
     hw, hh = mw / 2 / s, mh / 2 / s
@@ -219,11 +204,7 @@ def draw_map(t):
         cv2.polylines(img, [q], False, col[::-1], wdt, cv2.LINE_AA, shift=2)
     # route: future (white, thin) then travelled (amber, thick with dark casing)
     poly(path, (255, 255, 255), 5)
-    done = [path[0]]
-    for i in range(1, len(path)):
-        if lens[i] <= L: done.append(path[i])
-        else: break
-    done.append(pin)
+    done = list(path[lens < L]) + [pin]
     if len(done) > 1:
         poly(done, (20, 14, 0), 15)
         poly(done, ACC, 9)
@@ -408,21 +389,33 @@ def draw_info(base, t, appear):
         sc_ = 1 + 0.06 * pulse
         icon = icon.resize((int(isz * sc_), int(isz * sc_)), Image.LANCZOS)
     content = Image.new('RGBA', (w, ch), (0, 0, 0, 0))
-    content.alpha_composite(icon, (int(32 + (isz - icon.width) / 2), int((ch - icon.height) / 2 - 34)))
-    tx = 32 + isz + 26
-    tf = fit_font(cur['title'], 'x', w - tx - 20, 56 if accent else 50)
     cd = ImageDraw.Draw(content)
     cd.text((32, 26), 'СЕЙЧАС', font=font('s', 20), fill=(scol if accent else TXT2) + (255,))
-    cd.text((tx, ch / 2 - 34 - 46), cur['title'], font=tf, fill=tcol + (255,))
+    stacked = w < 480
+    if stacked:   # narrow column (vertical format): icon on top, text below
+        iy = 70
+        content.alpha_composite(icon, (int(32 + (isz - icon.width) / 2), int(iy + (isz - icon.height) / 2)))
+        tx, ty = 32, iy + isz + 22
+        tf = fit_font(cur['title'], 'x', w - 64, 58 if accent else 50)
+        cd.text((tx, ty), cur['title'], font=tf, fill=tcol + (255,))
+        sy_ = ty + tf.size + 14
+        maxw = w - 64
+    else:
+        content.alpha_composite(icon, (int(32 + (isz - icon.width) / 2), int((ch - icon.height) / 2 - 34)))
+        tx = 32 + isz + 26
+        tf = fit_font(cur['title'], 'x', w - tx - 20, 56 if accent else 50)
+        cd.text((tx, ch / 2 - 34 - 46), cur['title'], font=tf, fill=tcol + (255,))
+        sy_ = ch / 2 - 34 + 16
+        maxw = w - tx - 20
     # sub may wrap
     sf = font('m', 26)
     words = cur['sub'].split(); lines = ['']
     for wd in words:
         trial = (lines[-1] + ' ' + wd).strip()
-        if text_w(trial, sf) > w - tx - 20 and lines[-1]: lines.append(wd)
+        if text_w(trial, sf) > maxw and lines[-1]: lines.append(wd)
         else: lines[-1] = trial
     for li, ln in enumerate(lines):
-        cd.text((tx, ch / 2 - 34 + 16 + li * 34), ln, font=sf, fill=scol + (255,))
+        cd.text((tx, sy_ + li * 34), ln, font=sf, fill=scol + (255,))
     # beat-progress bar at card bottom
     pf = min(max((b - cur['beats'][0]) / (cur['beats'][1] - cur['beats'][0]), 0), 1)
     cd.rounded_rectangle([32, ch - 40, w - 32, ch - 34], 3, fill=(0, 0, 0, 50) if accent else LINE + (255,))
@@ -497,9 +490,11 @@ def frame(i):
     # --- intro: full-bleed blurred drive + title
     if b < ib1 + 0.6:
         ia = 1 - ease((b - (ib1 - 0.6)) / 0.9)
-        full = cv2.resize(dimg, (W, int(W * dimg.shape[0] / dimg.shape[1])), interpolation=cv2.INTER_LINEAR)
-        oy = (full.shape[0] - H) // 2 + int(160 * (b / ib1))
-        full = full[oy:oy + H]
+        sc_ = max(W / dimg.shape[1], (H + 200) / dimg.shape[0])
+        full = cv2.resize(dimg, (int(dimg.shape[1] * sc_), int(dimg.shape[0] * sc_)), interpolation=cv2.INTER_LINEAR)
+        ox = (full.shape[1] - W) // 2
+        oy = min((full.shape[0] - H) // 2 + int(160 * (b / ib1)), full.shape[0] - H)
+        full = full[oy:oy + H, ox:ox + W]
         full = cv2.GaussianBlur(full, (0, 0), 18)
         full = (full.astype(np.float32) * 0.45).astype(np.uint8)
         bgf = Image.fromarray(cv2.cvtColor(full, cv2.COLOR_BGR2RGB)).convert('RGBA')
@@ -508,27 +503,50 @@ def frame(i):
         lay = Image.new('RGBA', (W, H), (0, 0, 0, 0))
         dr = ImageDraw.Draw(lay)
         k1 = ease((b - 0.3) / 1.2); k2 = ease((b - 1.2) / 1.2)
-        ttl = CFG['intro']['title']; tf = font('x', 104)
-        dr.text(((W - text_w(ttl, tf)) / 2, 330 + 30 * (1 - k1)), ttl, font=tf, fill=TXT + (int(255 * k1),))
-        sub = CFG['intro']['sub']; sf = font('m', 40)
-        dr.text(((W - text_w(sub, sf)) / 2, 470 + 20 * (1 - k1)), sub, font=sf, fill=ACC + (int(255 * k1),))
         names = ['А-180', 'Кемполово', 'налево', 'вдоль поля', 'RE:FRAME']
         cf = font('s', 32)
-        gaps = 64
-        widths = [text_w(n, cf) + 48 for n in names]
-        tot = sum(widths) + gaps * (len(names) - 1)
-        x0 = (W - tot) / 2; yy = 600
-        for j, (n, cw) in enumerate(zip(names, widths)):
-            kj = ease((b - 1.6 - j * 0.5) / 0.8)
-            if kj <= 0: x0 += cw + gaps; continue
-            isturn = n == 'налево'
-            fillc = ACC + (int(255 * kj),) if isturn else (255, 255, 255, int(28 * kj))
-            dr.rounded_rectangle([x0, yy + 16 * (1 - kj), x0 + cw, yy + 64 + 16 * (1 - kj)], 32, fill=fillc)
-            dr.text((x0 + 24, yy + 12 + 16 * (1 - kj)), n, font=cf, fill=(ACC_DK if isturn else TXT) + (int(255 * kj),))
-            if j < len(names) - 1:
-                ax = x0 + cw + gaps / 2
-                dr.polygon([(ax - 8, yy + 22), (ax + 8, yy + 32), (ax - 8, yy + 42)], fill=TXT2 + (int(255 * kj),))
-            x0 += cw + gaps
+        if VERT:
+            tlines = ['Как доехать', 'до RE:FRAME']; tf = font('x', 116)
+            for li, tl in enumerate(tlines):
+                dr.text(((W - text_w(tl, tf)) / 2, 520 + li * 136 + 30 * (1 - k1)), tl, font=tf, fill=TXT + (int(255 * k1),))
+            sub = CFG['intro']['sub']; sf = font('m', 44)
+            dr.text(((W - text_w(sub, sf)) / 2, 820 + 20 * (1 - k1)), sub, font=sf, fill=ACC + (int(255 * k1),))
+            cf = font('s', 38)
+            yy = 960
+            for j, n in enumerate(names):
+                kj = ease((b - 1.6 - j * 0.5) / 0.8)
+                cw = text_w(n, cf) + 64
+                x0 = (W - cw) / 2
+                if kj > 0:
+                    isturn = n == 'налево'
+                    fillc = ACC + (int(255 * kj),) if isturn else (255, 255, 255, int(28 * kj))
+                    oy = 16 * (1 - kj)
+                    dr.rounded_rectangle([x0, yy + oy, x0 + cw, yy + 76 + oy], 38, fill=fillc)
+                    dr.text((x0 + 32, yy + 14 + oy), n, font=cf, fill=(ACC_DK if isturn else TXT) + (int(255 * kj),))
+                    if j < len(names) - 1:
+                        ax = W / 2
+                        dr.polygon([(ax - 10, yy + 92), (ax + 10, yy + 92), (ax, yy + 106)], fill=TXT2 + (int(255 * kj),))
+                yy += 76 + 38
+        else:
+            ttl = CFG['intro']['title']; tf = font('x', 104)
+            dr.text(((W - text_w(ttl, tf)) / 2, 330 + 30 * (1 - k1)), ttl, font=tf, fill=TXT + (int(255 * k1),))
+            sub = CFG['intro']['sub']; sf = font('m', 40)
+            dr.text(((W - text_w(sub, sf)) / 2, 470 + 20 * (1 - k1)), sub, font=sf, fill=ACC + (int(255 * k1),))
+            gaps = 64
+            widths = [text_w(n, cf) + 48 for n in names]
+            tot = sum(widths) + gaps * (len(names) - 1)
+            x0 = (W - tot) / 2; yy = 600
+            for j, (n, cw) in enumerate(zip(names, widths)):
+                kj = ease((b - 1.6 - j * 0.5) / 0.8)
+                if kj <= 0: x0 += cw + gaps; continue
+                isturn = n == 'налево'
+                fillc = ACC + (int(255 * kj),) if isturn else (255, 255, 255, int(28 * kj))
+                dr.rounded_rectangle([x0, yy + 16 * (1 - kj), x0 + cw, yy + 64 + 16 * (1 - kj)], 32, fill=fillc)
+                dr.text((x0 + 24, yy + 12 + 16 * (1 - kj)), n, font=cf, fill=(ACC_DK if isturn else TXT) + (int(255 * kj),))
+                if j < len(names) - 1:
+                    ax = x0 + cw + gaps / 2
+                    dr.polygon([(ax - 8, yy + 22), (ax + 8, yy + 32), (ax - 8, yy + 42)], fill=TXT2 + (int(255 * kj),))
+                x0 += cw + gaps
         alpha_paste(base, lay, (0, -40 * (1 - ia)), ia)
 
     if appear > 0:
