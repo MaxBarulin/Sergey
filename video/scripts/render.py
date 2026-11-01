@@ -565,7 +565,7 @@ def frame(i):
             alpha_paste(dpil, hud, ((dw - hud.width) / 2, 60 + (150 - hud.height) / 2), ha)
         if 66 <= b < 72.5:
             ka = ease((b - 66) / 0.6) * (1 - ease((b - 72) / 0.5))
-            ch_ = caption_chip('Слева — забор RE:FRAME', 'с треугольным узором')
+            ch_ = caption_chip('Слева — ворота RE:FRAME', 'с рисунком')
             alpha_paste(dpil, ch_, ((dw - ch_.width) / 2, 60), ka)
         alpha_paste(base, dpil, (dx, dy + 40 * (1 - appear)), appear)
 

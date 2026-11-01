@@ -51,7 +51,7 @@ def road_score(plate):
     return v + 0.8 * yellow
 
 
-def snap(path, score, search, sigma, iters=3):
+def snap(path, score, search, sigma, iters=3, penalty=0.6, centroid=False):
     h, w = score.shape
     for _ in range(iters):
         d = np.gradient(path, axis=0)
@@ -65,12 +65,25 @@ def snap(path, score, search, sigma, iters=3):
             ys = np.clip(q[:, 1], 0, h - 1).astype(np.float32)
             prof = cv2.remap(score, xs[None], ys[None], cv2.INTER_LINEAR)[0]
             prof = np.convolve(prof, np.ones(5) / 5, 'same')
-            prof -= 0.6 * np.abs(offs)  # prefer staying close to the guide
-            best[i] = offs[int(np.argmax(prof))]
+            prof -= penalty * np.abs(offs)  # prefer staying close to the guide
+            j = int(np.argmax(prof))
+            if centroid:  # centre of the bright band containing the maximum, not its brightest edge
+                thr = prof[j] - 0.35 * (prof[j] - np.percentile(prof, 20))
+                a_, b_ = j, j
+                while a_ > 0 and prof[a_ - 1] >= thr: a_ -= 1
+                while b_ < len(prof) - 1 and prof[b_ + 1] >= thr: b_ += 1
+                best[i] = (offs[a_] + offs[b_]) / 2
+            else:
+                best[i] = offs[j]
         best = np.convolve(np.pad(best, 8, mode='edge'), np.ones(17) / 17, 'valid')
         path = smooth(path + best[:, None] * n, sigma)
         search = max(search * 0.6, 4)
     return path
+
+
+def white_score(plate):
+    hsv = cv2.cvtColor(cv2.GaussianBlur(plate, (0, 0), 1.5), cv2.COLOR_BGR2HSV).astype(np.float32)
+    return hsv[..., 2] - 1.2 * hsv[..., 1]
 
 
 def trace_rows(plate, seed, y0, y1, win=3, halfw=4, guide=None, gw=0.25):
@@ -150,7 +163,23 @@ for k, rc in RC.items():
             c = np.array(rc['corner_near'], float)
             road = road[road[:, 1] <= c[1]]
             tail = guide[np.hypot(*(guide - c).T).argmin():]
-            tail = snap(resample(tail, 3.0), sc, rc.get('search', 20), rc.get('sigma', 4))
+            if 'tail_prefix' in rc:  # explicit junction -> start of the dirt road
+                pre = np.array(rc['tail_prefix'], float)
+                tail = np.vstack([pre, tail[np.hypot(*(tail - pre[-1]).T).argmin() + 1:]])
+            wsc = white_score(plate) if rc.get('tail_score') == 'white' else sc
+            tail = resample(smooth(resample(tail, 3.0), 3), 3.0)
+            n_fix = len(resample(np.array(rc.get('tail_prefix', [c, c + 0.1])), 3.0))
+            if 'tail_suffix' in rc:  # explicit end: last road point -> into the gate
+                suf = np.array(rc['tail_suffix'], float)
+                tail = np.vstack([tail[:np.hypot(*(tail - suf[0]).T).argmin()], suf])
+                tail = resample(tail, 3.0)
+            n_end = len(resample(np.array(rc['tail_suffix'], float), 3.0)) if 'tail_suffix' in rc else 0
+            snapped = snap(tail, wsc, rc.get('search', 20), rc.get('sigma', 4), penalty=rc.get('snap_penalty', 0.6), centroid=rc.get('centroid', False))
+            if n_end:
+                w_end = np.clip((len(tail) - n_end - np.arange(len(tail))) / 6, 0, 1)[:, None]
+                snapped = snapped * w_end + tail * (1 - w_end)
+            w_ = np.clip((np.arange(len(tail)) - n_fix) / 6, 0, 1)[:, None]  # keep the junction fixed
+            tail = tail * (1 - w_) + snapped * w_
             path = smooth(resample(np.vstack([road, tail]), 3.0), 2)
         else:
             path = road
